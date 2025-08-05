@@ -1,0 +1,22 @@
+[project]
+name = "pytemplate"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "ipympl>=0.9.7",
+    "matplotlib>=3.10.5",
+    "numpy>=2.3.2",
+    "pandas>=2.3.1",
+    "scipy>=1.16.1",
+    "scikit-learn>=1.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0.0", 
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
