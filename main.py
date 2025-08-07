@@ -57,7 +57,9 @@ def main():
     
     # 칼만필터 적용
     print("\n=== 칼만필터 적용 ===")
-    
+
+    var_m=np.deg2rad(1)**2  # 분산을 라디안으로 변환
+    var_n=np.deg2rad(1)**2  # 분산을 라디안으로 변환
     # 센서 노이즈를 분산 기반으로 설정
     kf = AngleKalmanFilter(dt=1.0, 
                           process_noise=1e-6,
@@ -69,8 +71,8 @@ def main():
     
     # 단일 센서 칼만필터 적용 (M_abs만 사용)
     single_kf = SingleAngleKalmanFilter(dt=1.0, 
-                                       process_noise=1e-7,
-                                       sensor_noise=var_m)
+                                       process_noise=1,
+                                       sensor_noise=1)
     single_kalman_filtered_radians = single_kf.filter_data(m_abs_radians)
     
     # 선형 에러 분석 비교
