@@ -78,6 +78,18 @@ def add_gaussian_noise(angle: np.ndarray, std: float, seed: int | None = None) -
     noisy = wrap_2pi(angle + rng.normal(0.0, std, size=angle.shape))
     return noisy
 
+# --- 양자화 함수 (엔코더 분해능 시뮬레이션) ---
+def quantize_angle(angle: np.ndarray, bits: int) -> np.ndarray:
+    """주어진 비트 수 분해능(2^bits) 로 각도를 양자화 (round to nearest code).
+    angle: 0~2π 범위 (rad)
+    returns: 0~2π 양자화 결과
+    """
+    levels = 1 << bits
+    step = 2 * np.pi / levels
+    # 라운드 후 wrap
+    q = np.floor(angle / step + 0.5) * step
+    return wrap_2pi(q)
+
 # --- 선형 칼만필터 생성 (상태: [theta, omega], 측정: theta) ---
 def create_angle_kf(dt: float, process_var: float, meas_var: float) -> KalmanFilter:
     """상태벡터 x=[theta, omega]^T, 측정 z=[theta] 모델 칼만필터 생성.
@@ -103,7 +115,7 @@ if __name__ == "__main__":
 
     # 파라미터
     rpm = 100
-    spp = 1024
+    spp = 32
     target_rev = 10
     noise_std = np.deg2rad(1)  # 측정 표준편차 (rad)
 
@@ -113,28 +125,36 @@ if __name__ == "__main__":
     # 시스템매틱 엔코더 에러 추가 (2,3,5 고조파)
     th_sys, sys_err = add_harmonic_systematic_error(th, harmonics=(2,3,5), amps_deg=(1.0,0.7,0.5), max_total_deg=2.0, seed=7)
 
-    # 랜덤 노이즈 추가
-    noisy_th = add_gaussian_noise(th_sys, noise_std, seed=42)
+    # 랜덤 노이즈 추가 (양자화 전)
+    noisy_th_pre = add_gaussian_noise(th_sys, noise_std, seed=42)
+
+    # 10비트 양자화
+    bits = 10
+    meas_th = quantize_angle(noisy_th_pre, bits)
+    quant_step = 2 * np.pi / (1 << bits)
+    quant_theoretical_rms = quant_step / np.sqrt(12)  # 이상적 양자화 RMS (rad)
 
     dt = 60.0 / (spp * rpm)
 
-    meas_var = noise_std**2
+    meas_var = noise_std**2  # 필터 R: 아직 양자화 포함 추가분은 반영 안함 (필요시 조정)
 
-    # ---------------- q 리스트 반복 실행 (Kalman vs systematic vs measurement error 비교) ----------------
+    # q 리스트 반복
     q_list = [1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 5e-4]
     kalman_errors = []  # (q, err_est(rad), est_theta, est_omega, rms_err)
 
-    # 공통 에러 (측정, 시스템매틱)
-    err_meas = diffpi(noisy_th, th)          # measurement error vs true
-    sys_err_true = diffpi(th_sys, th)        # pure systematic (rad)
+    # 에러 (양자화 전/후)
+    err_meas_pre = diffpi(noisy_th_pre, th)   # noise + systematic
+    err_meas_q = diffpi(meas_th, th)          # quantized measurement error vs true
+    err_quant_only = diffpi(meas_th, noisy_th_pre)  # pure quantization effect
+    sys_err_true = diffpi(th_sys, th)
 
     for q in q_list:
         kf = create_angle_kf(dt, q, meas_var)
-        kf.x = np.array([[noisy_th[0]], [0.0]])
+        kf.x = np.array([[meas_th[0]], [0.0]])  # 초기 theta: 양자화된 측정
         H = kf.H; I = np.eye(2)
-        est_theta = np.zeros_like(noisy_th)
-        est_omega = np.zeros_like(noisy_th)
-        for i, z in enumerate(noisy_th):
+        est_theta = np.zeros_like(meas_th)
+        est_omega = np.zeros_like(meas_th)
+        for i, z in enumerate(meas_th):
             if i > 0:
                 kf.predict()
             y = diffpi(z, kf.x[0, 0])
@@ -152,40 +172,47 @@ if __name__ == "__main__":
     # 단위 변환
     th_deg = np.degrees(th)
     th_sys_deg = np.degrees(th_sys)
-    noisy_deg = np.degrees(noisy_th)
+    noisy_pre_deg = np.degrees(noisy_th_pre)
+    meas_deg = np.degrees(meas_th)
     sys_err_deg = np.degrees(sys_err_true)
-    err_meas_deg = np.degrees(err_meas)
+    err_meas_pre_deg = np.degrees(err_meas_pre)
+    err_meas_q_deg = np.degrees(err_meas_q)
+    err_quant_only_deg = np.degrees(err_quant_only)
 
-    # 플롯 1: 각도 (참, 시스템매틱, 측정)
+    # 플롯 1: 각도 (참, 시스템매틱, 노이즈전/후)
     plt.figure(figsize=(12,6))
     plt.plot(t, th_deg, label='True', linewidth=2, color='k')
-    plt.plot(t, th_sys_deg, label='Systematic Added', alpha=0.7)
-    plt.plot(t, noisy_deg, label='Systematic+Noise (Measured)', alpha=0.4)
-    plt.xlabel('Time (s)'); plt.ylabel('Angle (deg)'); plt.title('Angle Signals')
+    plt.plot(t, th_sys_deg, label='True+Systematic', alpha=0.7)
+    plt.plot(t, noisy_pre_deg, label='Sys+Noise (pre-quant)', alpha=0.4)
+    plt.plot(t, meas_deg, label='Quantized (10-bit)', alpha=0.7, linestyle='--')
+    plt.xlabel('Time (s)'); plt.ylabel('Angle (deg)'); plt.title('Angle Signals with 10-bit Quantization')
     plt.legend(); plt.grid(alpha=0.3)
 
-    # 플롯 2: 에러 비교 (Systematic, Measurement, Kalman(q...))
+    # 플롯 2: 에러 비교 (Systematic, Measurement pre/post, Kalman)
     plt.figure(figsize=(12,6))
     plt.plot(t, sys_err_deg, label='Systematic Error (true)', linewidth=2, color='orange')
-    plt.plot(t, err_meas_deg, label='Measurement Error', alpha=0.5, color='gray')
+    plt.plot(t, err_meas_pre_deg, label='Meas Error pre-quant', alpha=0.4, color='gray')
+    plt.plot(t, err_meas_q_deg, label='Meas Error quantized', alpha=0.7, color='black')
     cmap = plt.cm.get_cmap('viridis', len(kalman_errors))
     for idx, (q, err_est, *_rest) in enumerate(kalman_errors):
         plt.plot(t, np.degrees(err_est), label=f'Kalman q={q:g}', color=cmap(idx), linewidth=1)
-    plt.xlabel('Time (s)'); plt.ylabel('Error (deg)'); plt.title('Error vs Time for Different q')
+    plt.xlabel('Time (s)'); plt.ylabel('Error (deg)'); plt.title('Error vs Time (10-bit quantized)')
     plt.legend(ncol=2, fontsize=8); plt.grid(alpha=0.3)
 
-    # 플롯 3: Kalman RMS vs q (log q)
+    # 플롯 3: Kalman RMS vs q (log q) + 측정 RMS (quantized)
     plt.figure(figsize=(8,4))
     qs = [q for q, *_ in kalman_errors]
     rms_deg = [np.degrees(r) for *_, r in kalman_errors]
     plt.semilogx(qs, rms_deg, marker='o')
-    meas_rms_deg = np.degrees(np.sqrt(np.mean(err_meas**2)))
-    sys_rms_deg = np.degrees(np.sqrt(np.mean(sys_err_true**2)))
-    plt.axhline(meas_rms_deg, color='gray', linestyle='--', label=f'Meas RMS {meas_rms_deg:.3f}°')
-    plt.axhline(sys_rms_deg, color='orange', linestyle='--', label=f'Systematic RMS {sys_rms_deg:.3f}°')
+    meas_rms_deg = np.degrees(np.sqrt(np.mean(err_meas_q**2)))
+    meas_pre_rms_deg = np.degrees(np.sqrt(np.mean(err_meas_pre**2)))
+    quant_rms_theo_deg = np.degrees(quant_theoretical_rms)
+    plt.axhline(meas_rms_deg, color='black', linestyle='--', label=f'Meas (quant) RMS {meas_rms_deg:.3f}°')
+    plt.axhline(meas_pre_rms_deg, color='gray', linestyle=':', label=f'Meas pre-quant RMS {meas_pre_rms_deg:.3f}°')
+    plt.axhline(quant_rms_theo_deg, color='purple', linestyle='-.', label=f'Quantization RMS ideal {quant_rms_theo_deg:.3f}°')
     plt.xlabel('q (process noise)'); plt.ylabel('RMS Error (deg)')
-    plt.title('Kalman RMS Error vs q')
-    plt.legend(); plt.grid(alpha=0.3, which='both')
+    plt.title('Kalman RMS Error vs q (10-bit)')
+    plt.legend(fontsize=8); plt.grid(alpha=0.3, which='both')
 
     # 플롯 4: 선택 q 에 대한 추정 각속도 (rpm)
     plt.figure(figsize=(12,4))
@@ -194,13 +221,33 @@ if __name__ == "__main__":
         q, _err_est, _est_theta, est_omega, _rms = kalman_errors[si]
         plt.plot(t, est_omega * 60/(2*np.pi), label=f'q={q:g}')
     plt.hlines(rpm, t[0], t[-1], colors='k', linestyles='--', label='True RPM')
-    plt.xlabel('Time (s)'); plt.ylabel('RPM'); plt.title('Estimated RPM (selected q)')
+    plt.xlabel('Time (s)'); plt.ylabel('RPM'); plt.title('Estimated RPM (selected q, 10-bit)')
     plt.legend(); plt.grid(alpha=0.3)
 
+    # 플롯 5: 해상도 향상 (bits gain)
+    plt.figure(figsize=(8,4))
+    kalman_rms = np.array([r for *_, r in kalman_errors])
+    meas_rms = np.sqrt(np.mean(err_meas_q**2))
+    gain_factor = meas_rms / kalman_rms
+    bits_gain = np.log2(gain_factor)
+    plt.semilogx(qs, bits_gain, marker='s', color='teal')
+    plt.axhline(0, color='gray', linewidth=0.8)
+    plt.xlabel('q (process noise)'); plt.ylabel('Bits Gain (log2(sigma_meas/sigma_kf))')
+    plt.title('Effective Resolution Improvement (10-bit input)')
+    for q, bg in zip(qs, bits_gain):
+        plt.text(q, bg, f'{bg:.2f}', fontsize=8, ha='center', va='bottom')
+    plt.grid(alpha=0.3, which='both')
+
     # 콘솔 요약 출력
-    print('\nKalman q vs RMS (rad / deg):')
-    for q, _err_est, _est_theta, _est_omega, rms_err in kalman_errors:
-        print(f'q={q:>8g}  RMS={rms_err:.6e} rad ({np.degrees(rms_err):.4f}°)')
+    print('\n--- Quantization / Resolution Info ---')
+    print(f'Bits: {bits}, Step(deg): {np.degrees(quant_step):.6f}, Ideal quant RMS(deg): {quant_rms_theo_deg:.6f}')
+    print(f'Meas pre-quant RMS: {meas_pre_rms_deg:.6f} deg')
+    print(f'Meas quantized RMS: {meas_rms_deg:.6f} deg')
+    print(f'Quantization-only RMS: {np.degrees(np.sqrt(np.mean(err_quant_only**2))):.6f} deg')
+
+    print('\nKalman q vs RMS / Gain:')
+    for (q, _err_est, _est_theta, _est_omega, rms_err), bg in zip(kalman_errors, bits_gain):
+        print(f'q={q:>8g}  RMS={rms_err:.6e} rad ({np.degrees(rms_err):.4f}°)  Gain={meas_rms/np.degrees(rms_err):.3f}  BitsGain={bg:.3f}')
 
     plt.tight_layout()
     plt.show()
