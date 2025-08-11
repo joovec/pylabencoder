@@ -30,6 +30,20 @@
             "args": ["sync"],
             "group": "none",
             "problemMatcher": []
+        },
+        {
+            "label": "UV: Run Current File",
+            "type": "shell",
+            "command": "uv",
+            "args": ["run", "python", "${file}"],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            },
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
         }
     ]
 }
