@@ -2,6 +2,9 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from filterpy.kalman import KalmanFilter
+# 유니코드 마이너스 폰트 경고 제거
+import matplotlib as mpl
+mpl.rcParams['axes.unicode_minus'] = False
 
 
 
@@ -110,144 +113,394 @@ def create_angle_kf(dt: float, process_var: float, meas_var: float) -> KalmanFil
     kf.P = np.diag([10.0, 10.0])  # 초기 공분산 (불확실 크게)
     return kf
 
+# --- CA(등가속) 모델 칼만필터 생성 (상태: [theta, omega, alpha], 측정: theta) ---
+def create_angle_kf_ca(dt: float, process_var: float, meas_var: float) -> KalmanFilter:
+    """Constant Acceleration model.
+    상태 x = [θ, ω, α]^T
+    F = [[1, dt, 0.5*dt^2],
+         [0,  1,      dt  ],
+         [0,  0,       1  ]]
+    H = [1, 0, 0]
+    Q (white jerk spectral density q=process_var):
+      Q = q * [[dt^5/20, dt^4/8, dt^3/6],
+               [dt^4/8,  dt^3/3, dt^2/2],
+               [dt^3/6,  dt^2/2, dt     ]]
+    """
+    kf = KalmanFilter(dim_x=3, dim_z=1)
+    kf.F = np.array([[1.0, dt, 0.5*dt*dt],
+                     [0.0, 1.0, dt],
+                     [0.0, 0.0, 1.0]])
+    kf.H = np.array([[1.0, 0.0, 0.0]])
+    q = process_var
+    kf.Q = q * np.array([[dt**5/20.0, dt**4/8.0, dt**3/6.0],
+                         [dt**4/8.0,  dt**3/3.0, dt**2/2.0],
+                         [dt**3/6.0,  dt**2/2.0, dt]])
+    kf.R = np.array([[meas_var]])
+    kf.P = np.diag([1.0, 10.0, 100.0])  # 초기 공분산 적절히 감소
+    return kf
+
+# 신규 언랩 함수 (필터에서 언랩 각 사용)
+def unwrap_sequence(wrapped: np.ndarray) -> np.ndarray:
+    out = np.zeros_like(wrapped)
+    acc = wrapped[0]
+    out[0] = acc
+    for i in range(1, len(wrapped)):
+        acc += diffpi(wrapped[i], wrapped[i-1])
+        out[i] = acc
+    return out
+
 if __name__ == "__main__":
     setup_korean_font()
 
-    # 파라미터
-    rpm = 100
-    spp = 32
-    target_rev = 10
-    noise_std = np.deg2rad(1)  # 측정 표준편차 (rad)
+    # ================= 로봇 액추에이터 가속도 시나리오 (0~1000 RPM) ONLY =================
+    print('\n=== Robot Actuator Acceleration Scenarios (0~1000RPM) : CV vs CA (tuning + spec S-curve) ===')
 
-    # 시간/각도 생성
-    t, th = generate_true_angle(rpm=rpm, spp=spp, target_rev=target_rev)
+    # ----- 일반적인 서보/모터 스펙 (예시 값) -----
+    # (실제 시스템 값으로 교체 가능)
+    T_peak_Nm = 2.5          # 피크 토크 (Nm)
+    J_load = 0.002           # 부하 관성 (kg*m^2)
+    gear_ratio = 10.0        # 감속비 (motor:load = 1:gear_ratio)
+    J_motor = 0.00005        # 모터 로터 관성 (kg*m^2)
+    # 부하 관성을 모터측 환산
+    J_equiv = J_motor + J_load / (gear_ratio**2)
+    alpha_max = T_peak_Nm / J_equiv              # rad/s^2 실제 최대 가속 근사
+    alpha_max_rpm_s = alpha_max * 60/(2*np.pi)   # RPM/s 변환
+    # jerk 한계 (경험적): 최대 가속을 40~60ms 정도에 도달하도록 설정
+    t_rise_accel = 0.05                          # 가속 상승 목표 시간 (s)
+    j_max = alpha_max / t_rise_accel             # rad/s^3
+    j_max_rpm_s2 = j_max * 60/(2*np.pi)          # RPM/s^2
+    print(f'[Spec] alpha_max ≈ {alpha_max_rpm_s:.1f} RPM/s, j_max ≈ {j_max_rpm_s2:.1f} RPM/s^2')
 
-    # 시스템매틱 엔코더 에러 추가 (2,3,5 고조파)
-    th_sys, sys_err = add_harmonic_systematic_error(th, harmonics=(2,3,5), amps_deg=(1.0,0.7,0.5), max_total_deg=2.0, seed=7)
+    # ----- 파라미터 -----
+    noise_std = np.deg2rad(1)            # 센서 랜덤 노이즈 표준편차 (rad)
+    dt2 = 0.0005                         # 2 kHz
+    total_time = 4.0
+    t2 = np.arange(0.0, total_time, dt2)
+    bits2 = 10
+    quant_step2 = 2*np.pi / (1<<bits2)
+    quant_var2 = (quant_step2**2)/12.0   # 이상적 양자화 분산
+    meas_var2 = noise_std**2 + quant_var2
 
-    # 랜덤 노이즈 추가 (양자화 전)
-    noisy_th_pre = add_gaussian_noise(th_sys, noise_std, seed=42)
+    # q 후보 (CV: accel variance, CA: jerk spectral density)
+    # 가속도 시나리오에 맞게 더 큰 범위 추가
+    q_cv_list = [1e-5, 3e-5, 1e-4, 3e-4, 1e-3]
+    q_ca_list = [3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2]
 
-    # 10비트 양자화
-    bits = 10
-    meas_th = quantize_angle(noisy_th_pre, bits)
-    quant_step = 2 * np.pi / (1 << bits)
-    quant_theoretical_rms = quant_step / np.sqrt(12)  # 이상적 양자화 RMS (rad)
+    # Adaptive CA 옵션
+    use_adaptive_ca = True
+    adapt_innov_thresh_sigma = 4.0   # |innovation| > threshold * sqrt(R) 시 boost (덜 민감하게)
+    adapt_boost_factor = 3.0         # 가속도 관련 process noise 임시 확대 배수 (적절히 감소)
+    adapt_decay = 0.98               # 매 스텝 감쇠 (더 빠른 감쇠)
 
-    dt = 60.0 / (spp * rpm)
+    def rpm_to_rad(rpm_val):
+        return rpm_val * 2*np.pi / 60.0
 
-    meas_var = noise_std**2  # 필터 R: 아직 양자화 포함 추가분은 반영 안함 (필요시 조정)
+    # ----- Jerk 제한 S-curve 가속 프로파일 생성 함수 -----
+    def scurve_speed_profile(t: np.ndarray, rpm_start: float, rpm_end: float, accel_window: float,
+                             alpha_lim_rpm_s: float, j_lim_rpm_s2: float):
+        """단측(가속만) jerk 제한 S-curve 로 rpm_start -> rpm_end 가속 후 유지.
+        - 7-seg full 구현이 아니라 (+j, 0, -j) 3세그 가속 (필요시 plateau) 구성.
+        - Δv 가 너무 작아 plateau 불필요하면 삼각형( jerk up/down ) 패턴.
+        accel_window: 가속이 완료되도록 허용되는 최대 시간 (s)
+        alpha_lim_rpm_s, j_lim_rpm_s2: 한계 가속/jerk (RPM 계)
+        """
+        rpm_delta = rpm_end - rpm_start
+        if rpm_delta <= 0:
+            return np.full_like(t, rpm_start)
+        # 기본 t_j (jerk 상승시간)
+        t_j = alpha_lim_rpm_s / j_lim_rpm_s2
+        # plateau 없는 삼각 조건 판단
+        # 삼각 S-curve (jerk up + jerk down) 속도 변화: Δv_tri = alpha^2 / j
+        delta_v_tri = alpha_lim_rpm_s**2 / j_lim_rpm_s2
+        if rpm_delta <= delta_v_tri + 1e-9:
+            # 목표 속도를 위해 필요한 피크 가속 alpha_peak 계산
+            alpha_peak = (rpm_delta * j_lim_rpm_s2)**0.5
+            t_j_eff = alpha_peak / j_lim_rpm_s2
+            T_acc = 2 * t_j_eff
+            if T_acc > accel_window:
+                # accel_window 안에 맞추려면 jerk 확장 (alpha_peak 유지) 대신 alpha 축소
+                alpha_peak = (rpm_delta * j_lim_rpm_s2 * (accel_window/(2*t_j_eff)))**0.5
+                t_j_eff = alpha_peak / j_lim_rpm_s2
+                T_acc = 2 * t_j_eff
+            # 시간축 따라 속도 생성
+            rpm_arr = np.zeros_like(t, dtype=float)
+            for i, ti in enumerate(t):
+                if ti <= t_j_eff:  # jerk up
+                    a = j_lim_rpm_s2 * ti
+                    v_inc = 0.5 * j_lim_rpm_s2 * ti**2
+                elif ti <= 2*t_j_eff:  # jerk down
+                    tau = ti - t_j_eff
+                    a = alpha_peak - j_lim_rpm_s2 * tau
+                    v_inc = 0.5 * j_lim_rpm_s2 * t_j_eff**2 + alpha_peak * tau - 0.5 * j_lim_rpm_s2 * tau**2
+                else:
+                    v_inc = rpm_delta
+                rpm_arr[i] = rpm_start + min(v_inc, rpm_delta)
+            return rpm_arr
+        # plateau 존재하는 경우
+        t_a = (rpm_delta - delta_v_tri) / alpha_lim_rpm_s  # 상수 가속 유지 시간
+        T_acc = 2*t_j + t_a
+        if T_acc > accel_window:
+            # accel_window 안에 맞추도록 alpha 효율적 축소 -> scale 비율 s
+            s = accel_window / T_acc
+            alpha_eff = alpha_lim_rpm_s * s
+            j_eff = j_lim_rpm_s2 * s    # 단순 스케일 (보수적)
+            t_j_eff = alpha_eff / j_eff
+            delta_v_tri_eff = alpha_eff**2 / j_eff
+            t_a_eff = (rpm_delta - delta_v_tri_eff) / alpha_eff if rpm_delta > delta_v_tri_eff else 0.0
+            if t_a_eff < 0: t_a_eff = 0.0
+            T_acc_eff = 2*t_j_eff + t_a_eff
+            # 재생성
+            rpm_arr = np.zeros_like(t, dtype=float)
+            for i, ti in enumerate(t):
+                if ti <= t_j_eff:  # jerk up
+                    v_inc = 0.5 * j_eff * ti**2
+                elif ti <= t_j_eff + t_a_eff:  # const accel
+                    tau = ti - t_j_eff
+                    v_inc = 0.5 * j_eff * t_j_eff**2 + alpha_eff * tau
+                elif ti <= 2*t_j_eff + t_a_eff:  # jerk down
+                    tau = ti - (t_j_eff + t_a_eff)
+                    v_inc = (0.5 * j_eff * t_j_eff**2 + alpha_eff * t_a_eff +
+                              alpha_eff * tau - 0.5 * j_eff * tau**2)
+                else:
+                    v_inc = rpm_delta
+                rpm_arr[i] = rpm_start + min(v_inc, rpm_delta)
+            return rpm_arr
+        # 정상 케이스 (스펙 한계 내에서 목표 달성)
+        rpm_arr = np.zeros_like(t, dtype=float)
+        for i, ti in enumerate(t):
+            if ti <= t_j:  # jerk up
+                v_inc = 0.5 * j_lim_rpm_s2 * ti**2
+            elif ti <= t_j + t_a:  # const accel
+                tau = ti - t_j
+                v_inc = 0.5 * j_lim_rpm_s2 * t_j**2 + alpha_lim_rpm_s * tau
+            elif ti <= 2*t_j + t_a:  # jerk down
+                tau = ti - (t_j + t_a)
+                v_inc = (0.5 * j_lim_rpm_s2 * t_j**2 + alpha_lim_rpm_s * t_a +
+                          alpha_lim_rpm_s * tau - 0.5 * j_lim_rpm_s2 * tau**2)
+            else:
+                v_inc = rpm_delta
+            rpm_arr[i] = rpm_start + min(v_inc, rpm_delta)
+        return rpm_arr
 
-    # q 리스트 반복
-    q_list = [1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 5e-4]
-    kalman_errors = []  # (q, err_est(rad), est_theta, est_omega, rms_err)
+    # 기존 간단 프로파일 + 스펙기반 S-curve 추가
+    def prof_const_500(t): return np.full_like(t, 500.0)
+    def prof_scurve_0_1000(t):
+        accel_window = 1.5  # 1.5초 안에 0->1000RPM
+        return scurve_speed_profile(t, 0.0, 1000.0, accel_window, alpha_max_rpm_s, j_max_rpm_s2)
+    def prof_scurve_200_800(t):
+        accel_window = 1.0  # 1초 안에 200->800RPM
+        base = scurve_speed_profile(t, 200.0, 800.0, accel_window, alpha_max_rpm_s, j_max_rpm_s2)
+        return base
+    def prof_sinusoidal(t): return 500.0 + 300.0 * np.sin(2*np.pi * t / total_time)
 
-    # 에러 (양자화 전/후)
-    err_meas_pre = diffpi(noisy_th_pre, th)   # noise + systematic
-    err_meas_q = diffpi(meas_th, th)          # quantized measurement error vs true
-    err_quant_only = diffpi(meas_th, noisy_th_pre)  # pure quantization effect
-    sys_err_true = diffpi(th_sys, th)
+    # 현실성 낮은 ramp/trapezoid/step 제거
+    profiles = [
+        ("Const 500RPM", prof_const_500),
+        ("S-curve 0->1000", prof_scurve_0_1000),
+        ("S-curve 200->800", prof_scurve_200_800),
+        ("Sin(500±300)", prof_sinusoidal),
+    ]
 
-    for q in q_list:
-        kf = create_angle_kf(dt, q, meas_var)
-        kf.x = np.array([[meas_th[0]], [0.0]])  # 초기 theta: 양자화된 측정
-        H = kf.H; I = np.eye(2)
-        est_theta = np.zeros_like(meas_th)
-        est_omega = np.zeros_like(meas_th)
-        for i, z in enumerate(meas_th):
-            if i > 0:
-                kf.predict()
-            y = diffpi(z, kf.x[0, 0])
-            S = H @ kf.P @ H.T + kf.R
-            K = kf.P @ H.T / S
-            kf.x = kf.x + K * y
-            kf.x[0, 0] = wrap_2pi(kf.x[0, 0])
-            kf.P = (I - K @ H) @ kf.P
-            est_theta[i] = kf.x[0, 0]
-            est_omega[i] = kf.x[1, 0]
-        err_est = diffpi(est_theta, th)
-        rms_err = float(np.sqrt(np.mean(err_est**2)))
-        kalman_errors.append((q, err_est, est_theta, est_omega, rms_err))
+    def quantize_angle(angle: np.ndarray, bits: int) -> np.ndarray:  # local
+        levels = 1 << bits
+        step = 2 * np.pi / levels
+        q = np.floor(angle / step + 0.5) * step
+        return wrap_2pi(q)
 
-    # 단위 변환
-    th_deg = np.degrees(th)
-    th_sys_deg = np.degrees(th_sys)
-    noisy_pre_deg = np.degrees(noisy_th_pre)
-    meas_deg = np.degrees(meas_th)
-    sys_err_deg = np.degrees(sys_err_true)
-    err_meas_pre_deg = np.degrees(err_meas_pre)
-    err_meas_q_deg = np.degrees(err_meas_q)
-    err_quant_only_deg = np.degrees(err_quant_only)
+    def integrate_angle_from_rpm(rpm_func, t):
+        rpm_series = rpm_func(t)
+        omega = rpm_to_rad(rpm_series)
+        theta = np.cumsum(omega) * dt2
+        return wrap_2pi(theta), rpm_series, omega
 
-    # 플롯 1: 각도 (참, 시스템매틱, 노이즈전/후)
-    plt.figure(figsize=(12,6))
-    plt.plot(t, th_deg, label='True', linewidth=2, color='k')
-    plt.plot(t, th_sys_deg, label='True+Systematic', alpha=0.7)
-    plt.plot(t, noisy_pre_deg, label='Sys+Noise (pre-quant)', alpha=0.4)
-    plt.plot(t, meas_deg, label='Quantized (10-bit)', alpha=0.7, linestyle='--')
-    plt.xlabel('Time (s)'); plt.ylabel('Angle (deg)'); plt.title('Angle Signals with 10-bit Quantization')
-    plt.legend(); plt.grid(alpha=0.3)
+    agg_rows = []
+    tuning_records = []  # (profile, model, q, rms_deg)
 
-    # 플롯 2: 에러 비교 (Systematic, Measurement pre/post, Kalman)
-    plt.figure(figsize=(12,6))
-    plt.plot(t, sys_err_deg, label='Systematic Error (true)', linewidth=2, color='orange')
-    plt.plot(t, err_meas_pre_deg, label='Meas Error pre-quant', alpha=0.4, color='gray')
-    plt.plot(t, err_meas_q_deg, label='Meas Error quantized', alpha=0.7, color='black')
-    cmap = plt.cm.get_cmap('viridis', len(kalman_errors))
-    for idx, (q, err_est, *_rest) in enumerate(kalman_errors):
-        plt.plot(t, np.degrees(err_est), label=f'Kalman q={q:g}', color=cmap(idx), linewidth=1)
-    plt.xlabel('Time (s)'); plt.ylabel('Error (deg)'); plt.title('Error vs Time (10-bit quantized)')
-    plt.legend(ncol=2, fontsize=8); plt.grid(alpha=0.3)
+    for name, fn in profiles:
+        th2, rpm_series, omega_series = integrate_angle_from_rpm(fn, t2)          # wrapped true angle
+        th2_unwrap = unwrap_sequence(th2)                                         # unwrapped true angle
+        # 시스템매틱 + 노이즈 + 양자화 (wrapped)
+        th2_sys, sys2_err = add_harmonic_systematic_error(th2, harmonics=(2,3,5), amps_deg=(1.0,0.7,0.5), max_total_deg=2.0, seed=11)
+        noisy2 = add_gaussian_noise(th2_sys, noise_std, seed=12)
+        meas2 = quantize_angle(noisy2, bits2)
+        meas2_unwrap = unwrap_sequence(meas2)
 
-    # 플롯 3: Kalman RMS vs q (log q) + 측정 RMS (quantized)
-    plt.figure(figsize=(8,4))
-    qs = [q for q, *_ in kalman_errors]
-    rms_deg = [np.degrees(r) for *_, r in kalman_errors]
-    plt.semilogx(qs, rms_deg, marker='o')
-    meas_rms_deg = np.degrees(np.sqrt(np.mean(err_meas_q**2)))
-    meas_pre_rms_deg = np.degrees(np.sqrt(np.mean(err_meas_pre**2)))
-    quant_rms_theo_deg = np.degrees(quant_theoretical_rms)
-    plt.axhline(meas_rms_deg, color='black', linestyle='--', label=f'Meas (quant) RMS {meas_rms_deg:.3f}°')
-    plt.axhline(meas_pre_rms_deg, color='gray', linestyle=':', label=f'Meas pre-quant RMS {meas_pre_rms_deg:.3f}°')
-    plt.axhline(quant_rms_theo_deg, color='purple', linestyle='-.', label=f'Quantization RMS ideal {quant_rms_theo_deg:.3f}°')
-    plt.xlabel('q (process noise)'); plt.ylabel('RMS Error (deg)')
-    plt.title('Kalman RMS Error vs q (10-bit)')
-    plt.legend(fontsize=8); plt.grid(alpha=0.3, which='both')
+        # Measurement error baseline (wrap 기반 비교 유지)
+        err_meas = diffpi(meas2, th2)
+        rms_meas = np.degrees(np.sqrt(np.mean(err_meas**2)))
 
-    # 플롯 4: 선택 q 에 대한 추정 각속도 (rpm)
-    plt.figure(figsize=(12,4))
-    select_idx = [0, len(kalman_errors)//2, -1]
-    for si in select_idx:
-        q, _err_est, _est_theta, est_omega, _rms = kalman_errors[si]
-        plt.plot(t, est_omega * 60/(2*np.pi), label=f'q={q:g}')
-    plt.hlines(rpm, t[0], t[-1], colors='k', linestyles='--', label='True RPM')
-    plt.xlabel('Time (s)'); plt.ylabel('RPM'); plt.title('Estimated RPM (selected q, 10-bit)')
-    plt.legend(); plt.grid(alpha=0.3)
+        # -------- CV q 스윕 (언랩 잔차) --------
+        best_cv = (None, 1e9, None, None)
+        for q_cv in q_cv_list:
+            kf_cv = create_angle_kf(dt2, q_cv, meas_var2)
+            # 상태 각도 언랩 값 사용
+            kf_cv.x = np.array([[meas2_unwrap[0]], [0.0]])
+            H_cv = kf_cv.H; I_cv = np.eye(2)
+            est_th_cv = np.zeros_like(meas2_unwrap)
+            est_om_cv = np.zeros_like(meas2_unwrap)
+            for i, z_unwrap in enumerate(meas2_unwrap):
+                if i>0:
+                    kf_cv.predict()
+                y = z_unwrap - kf_cv.x[0,0]   # 언랩 잔차
+                S = H_cv @ kf_cv.P @ H_cv.T + kf_cv.R
+                K = kf_cv.P @ H_cv.T / S
+                kf_cv.x = kf_cv.x + K * y
+                # 언랩 상태 -> wrap 제거 필요 없음
+                kf_cv.P = (I_cv - K @ H_cv) @ kf_cv.P
+                est_th_cv[i] = kf_cv.x[0,0]
+                est_om_cv[i] = kf_cv.x[1,0]
+            # 에러는 wrap 비교 (기존 기준 유지)
+            est_th_cv_wrapped = wrap_2pi(est_th_cv)
+            err_cv = diffpi(est_th_cv_wrapped, th2)
+            rms_cv = np.degrees(np.sqrt(np.mean(err_cv**2)))
+            tuning_records.append((name, 'CV', q_cv, rms_cv))
+            if rms_cv < best_cv[1]:
+                best_cv = (q_cv, rms_cv, est_th_cv, est_om_cv)
 
-    # 플롯 5: 해상도 향상 (bits gain)
-    plt.figure(figsize=(8,4))
-    kalman_rms = np.array([r for *_, r in kalman_errors])
-    meas_rms = np.sqrt(np.mean(err_meas_q**2))
-    gain_factor = meas_rms / kalman_rms
-    bits_gain = np.log2(gain_factor)
-    plt.semilogx(qs, bits_gain, marker='s', color='teal')
-    plt.axhline(0, color='gray', linewidth=0.8)
-    plt.xlabel('q (process noise)'); plt.ylabel('Bits Gain (log2(sigma_meas/sigma_kf))')
-    plt.title('Effective Resolution Improvement (10-bit input)')
-    for q, bg in zip(qs, bits_gain):
-        plt.text(q, bg, f'{bg:.2f}', fontsize=8, ha='center', va='bottom')
-    plt.grid(alpha=0.3, which='both')
+        # -------- CA q 스윕 (언랩 잔차) --------
+        best_ca = (None, 1e9, None, None, None)
+        for q_ca in q_ca_list:
+            kf_ca = create_angle_kf_ca(dt2, q_ca, meas_var2)
+            kf_ca.x = np.array([[meas2_unwrap[0]], [0.0], [0.0]])
+            H_ca = kf_ca.H; I_ca = np.eye(3)
+            est_th_ca = np.zeros_like(meas2_unwrap)
+            est_om_ca = np.zeros_like(meas2_unwrap)
+            est_al_ca = np.zeros_like(meas2_unwrap)
+            for i, z_unwrap in enumerate(meas2_unwrap):
+                if i>0:
+                    kf_ca.predict()
+                y = z_unwrap - kf_ca.x[0,0]
+                S = H_ca @ kf_ca.P @ H_ca.T + kf_ca.R
+                K = kf_ca.P @ H_ca.T / S
+                kf_ca.x = kf_ca.x + K * y
+                kf_ca.P = (I_ca - K @ H_ca) @ kf_ca.P
+                est_th_ca[i] = kf_ca.x[0,0]
+                est_om_ca[i] = kf_ca.x[1,0]
+                est_al_ca[i] = kf_ca.x[2,0]
+            est_th_ca_wrapped = wrap_2pi(est_th_ca)
+            err_ca = diffpi(est_th_ca_wrapped, th2)
+            rms_ca = np.degrees(np.sqrt(np.mean(err_ca**2)))
+            tuning_records.append((name, 'CA', q_ca, rms_ca))
+            if rms_ca < best_ca[1]:
+                best_ca = (q_ca, rms_ca, est_th_ca, est_om_ca, est_al_ca)
 
-    # 콘솔 요약 출력
-    print('\n--- Quantization / Resolution Info ---')
-    print(f'Bits: {bits}, Step(deg): {np.degrees(quant_step):.6f}, Ideal quant RMS(deg): {quant_rms_theo_deg:.6f}')
-    print(f'Meas pre-quant RMS: {meas_pre_rms_deg:.6f} deg')
-    print(f'Meas quantized RMS: {meas_rms_deg:.6f} deg')
-    print(f'Quantization-only RMS: {np.degrees(np.sqrt(np.mean(err_quant_only**2))):.6f} deg')
+        # -------- Adaptive CA (언랩 기반) --------
+        if use_adaptive_ca and best_ca[0] is not None:
+            base_q_ca = best_ca[0]
+            kf_ca_ad = create_angle_kf_ca(dt2, base_q_ca, meas_var2)
+            kf_ca_ad.x = np.array([[meas2_unwrap[0]], [0.0], [0.0]])
+            H_ca = kf_ca_ad.H; I_ca = np.eye(3)
+            est_th_ca_ad = np.zeros_like(meas2_unwrap)
+            est_om_ca_ad = np.zeros_like(meas2_unwrap)
+            est_al_ca_ad = np.zeros_like(meas2_unwrap)
+            boost = 1.0
+            thresh = adapt_innov_thresh_sigma * np.sqrt(meas_var2)
+            base_Q_unit = np.array([[dt2**5/20.0, dt2**4/8.0, dt2**3/6.0],
+                                    [dt2**4/8.0,  dt2**3/3.0, dt2**2/2.0],
+                                    [dt2**3/6.0,  dt2**2/2.0, dt2]])
+            for i, z_unwrap in enumerate(meas2_unwrap):
+                if i>0:
+                    kf_ca_ad.Q = base_q_ca * boost * base_Q_unit
+                    kf_ca_ad.predict()
+                y = z_unwrap - kf_ca_ad.x[0,0]
+                S = H_ca @ kf_ca_ad.P @ H_ca.T + kf_ca_ad.R
+                K = kf_ca_ad.P @ H_ca.T / S
+                kf_ca_ad.x = kf_ca_ad.x + K * y
+                kf_ca_ad.P = (I_ca - K @ H_ca) @ kf_ca_ad.P
+                est_th_ca_ad[i] = kf_ca_ad.x[0,0]
+                est_om_ca_ad[i] = kf_ca_ad.x[1,0]
+                est_al_ca_ad[i] = kf_ca_ad.x[2,0]
+                if abs(y) > thresh:
+                    boost = max(boost, adapt_boost_factor)
+                boost = 1.0 + (boost - 1.0) * adapt_decay
+            est_th_ca_ad_wrapped = wrap_2pi(est_th_ca_ad)
+            err_ca_ad = diffpi(est_th_ca_ad_wrapped, th2)
+            rms_ca_ad = np.degrees(np.sqrt(np.mean(err_ca_ad**2)))
+        else:
+            rms_ca_ad = None
+            est_th_ca_ad = est_om_ca_ad = est_al_ca_ad = None
 
-    print('\nKalman q vs RMS / Gain:')
-    for (q, _err_est, _est_theta, _est_omega, rms_err), bg in zip(kalman_errors, bits_gain):
-        print(f'q={q:>8g}  RMS={rms_err:.6e} rad ({np.degrees(rms_err):.4f}°)  Gain={meas_rms/np.degrees(rms_err):.3f}  BitsGain={bg:.3f}')
+        # 최종 선택
+        q_cv_best, rms_cv_best, est_th_cv_best_unwrap, est_om_cv_best = best_cv
+        q_ca_best, rms_ca_best, est_th_ca_best_unwrap, est_om_ca_best, est_al_ca_best = best_ca
+        gain_cv = rms_meas / rms_cv_best if rms_cv_best>0 else np.nan
+        gain_ca = rms_meas / rms_ca_best if rms_ca_best>0 else np.nan
+        gain_ca_ad = (rms_meas / rms_ca_ad) if (rms_ca_ad and rms_ca_ad>0) else None
+        agg_rows.append((name, rms_meas, rms_cv_best, rms_ca_best, rms_ca_ad, gain_cv, gain_ca, gain_ca_ad, q_cv_best, q_ca_best))
 
+        # Plot (wrapped 시각화)
+        est_th_cv_plot = wrap_2pi(est_th_cv_best_unwrap)
+        est_th_ca_plot = wrap_2pi(est_th_ca_best_unwrap)
+        if est_th_ca_ad is not None:
+            est_th_ca_ad_plot = wrap_2pi(est_th_ca_ad)
+
+        fig, axes = plt.subplots(5,1, figsize=(10,12), sharex=True)
+        axes[0].plot(t2, rpm_series, label='True RPM', color='k')
+        axes[0].plot(t2, est_om_cv_best * 60/(2*np.pi), label=f'CV RPM (q={q_cv_best:g})', alpha=0.7)
+        axes[0].plot(t2, est_om_ca_best * 60/(2*np.pi), label=f'CA RPM (q={q_ca_best:g})', alpha=0.7)
+        if rms_ca_ad is not None:
+            axes[0].plot(t2, est_om_ca_ad * 60/(2*np.pi), label='CA RPM adaptive', alpha=0.7, linestyle='--')
+        axes[0].set_ylabel('RPM'); axes[0].set_title(f'{name} Speed'); axes[0].legend(); axes[0].grid(alpha=0.3)
+
+        axes[1].plot(t2, np.degrees(err_meas), label='Meas Err', color='gray', alpha=0.35)
+        axes[1].plot(t2, np.degrees(diffpi(est_th_cv_plot, th2)), label='CV Err', color='tab:blue', linewidth=0.8)
+        axes[1].plot(t2, np.degrees(diffpi(est_th_ca_plot, th2)), label='CA Err', color='tab:green', linewidth=0.8)
+        if rms_ca_ad is not None:
+            axes[1].plot(t2, np.degrees(diffpi(est_th_ca_ad_plot, th2)), label='CA Err adaptive', color='tab:olive', linewidth=0.8)
+        axes[1].set_ylabel('Angle Err (deg)'); axes[1].legend(fontsize=8); axes[1].grid(alpha=0.3)
+
+        accel_true = np.gradient(rpm_to_rad(rpm_series), dt2) * 60/(2*np.pi)
+        accel_ca_best = est_al_ca_best * 60/(2*np.pi)
+        axes[2].plot(t2, accel_true, label='True Accel', color='purple')
+        axes[2].plot(t2, accel_ca_best, label='CA α', color='tab:green', alpha=0.8)
+        if rms_ca_ad is not None:
+            axes[2].plot(t2, est_al_ca_ad * 60/(2*np.pi), label='CA α adaptive', color='tab:olive', alpha=0.8)
+        axes[2].set_ylabel('Accel (RPM/s)'); axes[2].legend(fontsize=8); axes[2].grid(alpha=0.3)
+
+        axes[3].plot(t2, np.abs(np.degrees(diffpi(est_th_cv_plot, th2))), label='|CV Err|', color='tab:blue', alpha=0.6)
+        axes[3].plot(t2, np.abs(np.degrees(diffpi(est_th_ca_plot, th2))), label='|CA Err|', color='tab:green', alpha=0.6)
+        if rms_ca_ad is not None:
+            axes[3].plot(t2, np.abs(np.degrees(diffpi(est_th_ca_ad_plot, th2))), label='|CA Err| adaptive', color='tab:olive', alpha=0.6)
+        axes[3].set_ylabel('|Err| (deg)'); axes[3].legend(fontsize=8); axes[3].grid(alpha=0.3)
+
+        # RMS vs q tuning curves
+        cv_q_vals = [r[2] for r in tuning_records if r[0]==name and r[1]=='CV']
+        cv_rms_vals = [r[3] for r in tuning_records if r[0]==name and r[1]=='CV']
+        ca_q_vals = [r[2] for r in tuning_records if r[0]==name and r[1]=='CA']
+        ca_rms_vals = [r[3] for r in tuning_records if r[0]==name and r[1]=='CA']
+        axes[4].semilogx(cv_q_vals, cv_rms_vals, marker='o', label='CV RMS')
+        axes[4].semilogx(ca_q_vals, ca_rms_vals, marker='s', label='CA RMS')
+        axes[4].axhline(rms_meas, color='gray', linestyle='--', label='Meas RMS')
+        axes[4].axvline(q_cv_best, color='tab:blue', linestyle=':', alpha=0.6)
+        axes[4].axvline(q_ca_best, color='tab:green', linestyle=':', alpha=0.6)
+        axes[4].set_xlabel('q'); axes[4].set_ylabel('RMS (deg)'); axes[4].legend(fontsize=8); axes[4].grid(alpha=0.3, which='both')
+
+        fig.suptitle(f'{name}: Meas {rms_meas:.3f}° | CV {rms_cv_best:.3f}° (q={q_cv_best:g}, Gx{rms_meas/rms_cv_best:.2f}) | CA {rms_ca_best:.3f}° (q={q_ca_best:g}, Gx{rms_meas/rms_ca_best:.2f})' + (f' | CA_ad {rms_ca_ad:.3f}° (Gx{rms_meas/rms_ca_ad:.2f})' if rms_ca_ad else ''))
+        fig.tight_layout(rect=[0,0,1,0.94])
+        print(f'{name}: Meas={rms_meas:.4f}° | CV best q={q_cv_best:g} RMS={rms_cv_best:.4f}° | CA best q={q_ca_best:g} RMS={rms_ca_best:.4f}°' + (f' | CA adaptive RMS={rms_ca_ad:.4f}°' if rms_ca_ad else ''))
+
+    # Aggregate comparison
+    labels = [r[0] for r in agg_rows]
+    x = np.arange(len(labels))
+    width = 0.22
+    rms_meas_vals = [r[1] for r in agg_rows]
+    rms_cv_vals = [r[2] for r in agg_rows]
+    rms_ca_vals = [r[3] for r in agg_rows]
+    rms_ca_ad_vals = [r[4] if r[4] is not None else np.nan for r in agg_rows]
+    plt.figure(figsize=(11,5))
+    plt.bar(x - 1.5*width, rms_meas_vals, width, label='Meas', color='gray', alpha=0.5)
+    plt.bar(x - 0.5*width, rms_cv_vals, width, label='CV best', color='tab:blue')
+    plt.bar(x + 0.5*width, rms_ca_vals, width, label='CA best', color='tab:green')
+    plt.bar(x + 1.5*width, rms_ca_ad_vals, width, label='CA adaptive', color='tab:olive')
+    plt.xticks(x, labels, rotation=15)
+    plt.ylabel('RMS Angle Error (deg)')
+    plt.title('Scenario RMS Comparison (Best Tuned)')
+    plt.legend(fontsize=8); plt.grid(alpha=0.3, axis='y')
     plt.tight_layout()
+
+    print('\nSummary (Best):')
+    for row in agg_rows:
+        name, rms_meas, rms_cv_b, rms_ca_b, rms_ca_ad, g_cv, g_ca, g_ca_ad, qcvb, qcab = row
+        print(f'{name:14s} | Meas {rms_meas:6.3f}° | CV {rms_cv_b:6.3f}° (q={qcvb:g}) | CA {rms_ca_b:6.3f}° (q={qcab:g})' + (f' | CA_ad {rms_ca_ad:6.3f}°' if rms_ca_ad else ''))
+
     plt.show()
